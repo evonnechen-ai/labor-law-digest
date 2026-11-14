@@ -1,0 +1,24 @@
+name: 勞動法令日報
+
+on:
+  schedule:
+    # GitHub 使用 UTC 時間：23:20 UTC = 台灣時間早上 07:20
+    # （GitHub 排程尖峰時可能延遲 5–30 分鐘，所以避開整點）
+    - cron: "20 23 * * *"
+  workflow_dispatch: {}   # 可在 Actions 頁面手動按「Run workflow」測試
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python main.py
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
