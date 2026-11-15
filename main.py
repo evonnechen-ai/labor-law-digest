@@ -138,9 +138,46 @@ PROMPT = """你是台灣企業人資法遵顧問。以下是過去一天抓到�
 """
 
 
+GEMINI_MODELS = [
+    m.strip()
+    for m in os.environ.get(
+        "GEMINI_MODEL", "gemini-flash-latest,gemini-flash-lite-latest,gemini-2.5-flash"
+    ).split(",")
+    if m.strip()
+]
+
+
+def call_gemini(model, api_key, body):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    for attempt in range(3):  # 免費額度偶爾回 429/503，等一下再試
+        r = requests.post(url, headers={"x-goog-api-key": api_key}, json=body, timeout=150)
+        if r.status_code in (429, 500, 503) and attempt < 2:
+            time.sleep(30 * (attempt + 1))
+            continue
+        if r.status_code != 200:
+            # 印出 Google 回傳的完整錯誤說明，方便判斷原因
+            raise RuntimeError(f"HTTP {r.status_code} {r.text[:500]}")
+        break
+    res = r.json()
+    cands = res.get("candidates") or []
+    if not cands:
+        raise RuntimeError(f"沒有回傳內容：{json.dumps(res.get('promptFeedback', res), ensure_ascii=False)[:300]}")
+    parts = (cands[0].get("content") or {}).get("parts") or []
+    text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+    if not text.strip():
+        raise RuntimeError(f"回傳內容是空的（finishReason={cands[0].get('finishReason')}）")
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", text, re.S)  # 有時前後多了說明文字
+        if not m:
+            raise RuntimeError(f"回傳的不是 JSON：{text[:200]}")
+        return json.loads(m.group(0))
+
+
 def summarize(items, max_items):
-    api_key = os.environ["GEMINI_API_KEY"]
-    model = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+    api_key = os.environ["GEMINI_API_KEY"].strip()  # 去掉貼上金鑰時多帶的空白或換行
     news_text = "\n".join(
         f"[{i}] {it['title']}｜{it['source']}｜{it['date']}｜{it['snippet']}"
         for i, it in enumerate(items)
@@ -149,16 +186,17 @@ def summarize(items, max_items):
         "contents": [{"parts": [{"text": PROMPT.format(max_items=max_items, news=news_text)}]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2},
     }
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    for attempt in range(3):  # 免費額度偶爾回 429/503，重試幾次
-        r = requests.post(url, headers={"x-goog-api-key": api_key}, json=body, timeout=90)
-        if r.status_code in (429, 500, 503) and attempt < 2:
-            time.sleep(20 * (attempt + 1))
-            continue
-        r.raise_for_status()
-        break
-    text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-    data = json.loads(re.sub(r"^```(json)?|```$", "", text.strip()))
+    data, errors = None, []
+    for model in GEMINI_MODELS:  # 第一個模型失敗就自動換下一個
+        try:
+            data = call_gemini(model, api_key, body)
+            print(f"Gemini 摘要成功（模型：{model}）")
+            break
+        except Exception as ex:
+            errors.append(f"{model}: {ex}")
+            print(f"[警告] 模型 {model} 失敗：{ex}", file=sys.stderr)
+    if data is None:
+        raise RuntimeError(" / ".join(errors))
 
     picked = []
     for x in data.get("items", []):
@@ -263,16 +301,21 @@ def push(message):
     if os.environ.get("DRY_RUN") == "1":
         print(json.dumps(message, ensure_ascii=False, indent=2))
         return
-    r = requests.post(
-        "https://api.line.me/v2/bot/message/push",
-        headers={"Authorization": f"Bearer {os.environ['LINE_CHANNEL_ACCESS_TOKEN']}"},
-        json={"to": os.environ["LINE_USER_ID"], "messages": [message]},
-        timeout=30,
-    )
+    token = os.environ["LINE_CHANNEL_ACCESS_TOKEN"].strip()
+    # 預設 broadcast：推給官方帳號的「所有好友」（含你自己）
+    # 若只想推給自己，在 workflow 的 env 加 LINE_PUSH_MODE: "self"
+    mode = os.environ.get("LINE_PUSH_MODE", "broadcast").strip().lower()
+    if mode == "self":
+        url = "https://api.line.me/v2/bot/message/push"
+        payload = {"to": os.environ["LINE_USER_ID"].strip(), "messages": [message]}
+    else:
+        url = "https://api.line.me/v2/bot/message/broadcast"
+        payload = {"messages": [message]}
+    r = requests.post(url, headers={"Authorization": f"Bearer {token}"}, json=payload, timeout=30)
     if r.status_code != 200:
         print(f"[錯誤] LINE 推播失敗 {r.status_code}: {r.text}", file=sys.stderr)
         r.raise_for_status()
-    print("LINE 推播成功")
+    print(f"LINE 推播成功（模式：{'只推給自己' if mode == 'self' else '推給所有好友'}）")
 
 
 def main():
@@ -290,7 +333,8 @@ def main():
     try:
         picked, deadlines = summarize(items, max_items)
     except Exception as ex:
-        print(f"[警告] Gemini 摘要失敗，改用標題清單：{ex}", file=sys.stderr)
+        # ::warning:: 會讓錯誤顯示在 GitHub Actions 執行結果頁面最上方
+        print(f"::warning::Gemini 摘要失敗，已改推標題清單。原因：{ex}")
         picked, deadlines = fallback(items, max_items)
 
     if not picked:
