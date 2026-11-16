@@ -9,7 +9,6 @@
 
 選用環境變數：
   GEMINI_MODEL   預設 gemini-flash-latest（Google 會自動指向最新的 Flash 免費模型）
-  HOURS_BACK     抓取多少小時內的新聞，預設 26
   MAX_ITEMS      卡片最多顯示幾則，預設 6
   DRY_RUN        設為 1 時只印出卡片內容，不實際推播（測試用）
 """
@@ -37,18 +36,32 @@ KEYWORD_QUERIES = [
     "移工 OR 勞動檢查 OR 違反勞基法 裁罰",
 ]
 
-FEEDS = [
+MOL_FEEDS = [
     ("勞動部新聞稿", "https://www.mol.gov.tw/1607/1632/1633/RssList"),
     ("勞動部即時新聞澄清", "https://www.mol.gov.tw/1607/1632/2660/RssList"),
-] + [
-    (
-        "Google 新聞",
-        "https://news.google.com/rss/search?q="
-        + quote(f"({q}) when:1d")
-        + "&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
-    )
-    for q in KEYWORD_QUERIES
 ]
+
+# 這些是「轉載平台」：常把幾個月前的舊文章重新上架，日期會顯示成今天，所以排除
+BLOCKED_SOURCES = ["LINE TODAY", "LINE Today", "Yahoo", "MSN", "PChome", "Hinet", "蕃新聞", "TEEPR", "Newtalk 新頭殼 - 新聞"]
+
+
+def yesterday_range():
+    """回傳台灣時間「昨天 00:00」到「今天 00:00」"""
+    today0 = datetime.now(TW).replace(hour=0, minute=0, second=0, microsecond=0)
+    return today0 - timedelta(days=1), today0
+
+
+def build_feeds(start, end):
+    feeds = list(MOL_FEEDS)
+    # after:/before: 讓 Google 新聞只回傳昨天的報導（比 when:1d 更精準）
+    date_filter = f"after:{(start - timedelta(days=1)).strftime('%Y-%m-%d')} before:{end.strftime('%Y-%m-%d')}"
+    for q in KEYWORD_QUERIES:
+        feeds.append((
+            "Google 新聞",
+            "https://news.google.com/rss/search?q=" + quote(f"({q}) {date_filter}")
+            + "&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+        ))
+    return feeds
 
 CATEGORY_COLORS = {
     "法規修正": "#0F6E56",
@@ -81,10 +94,12 @@ def norm_title(t):
     return re.sub(r"[\s\W_]+", "", t)[:40]
 
 
-def fetch_news(hours_back):
-    since = datetime.now(timezone.utc) - timedelta(hours=hours_back)
+def fetch_news():
+    start, end = yesterday_range()
+    print(f"抓取範圍（台灣時間）：{start:%Y-%m-%d %H:%M} ～ {end:%Y-%m-%d %H:%M}")
     items, seen = [], set()
-    for source_name, url in FEEDS:
+    dropped = {"無日期": 0, "不是昨天": 0, "轉載平台": 0}
+    for source_name, url in build_feeds(start, end):
         try:
             resp = requests.get(url, headers=HEADERS, timeout=20)
             resp.raise_for_status()
@@ -94,34 +109,43 @@ def fetch_news(hours_back):
             continue
         for e in feed.entries:
             t = entry_time(e)
-            if t and t < since:
+            if t is None:  # 沒有日期的一律不收，避免舊聞混入
+                dropped["無日期"] += 1
+                continue
+            if not (start <= t.astimezone(TW) < end):  # 只收台灣時間「昨天」
+                dropped["不是昨天"] += 1
                 continue
             title = clean(e.get("title"))
+            src = source_name
+            if source_name == "Google 新聞":
+                src = clean((e.get("source") or {}).get("title")) or "Google 新聞"
+            if any(b.lower() in src.lower() for b in BLOCKED_SOURCES):
+                dropped["轉載平台"] += 1
+                continue
             key = norm_title(title)
             if not title or key in seen:
                 continue
             seen.add(key)
-            src = source_name
-            if source_name == "Google 新聞":
-                src = clean((e.get("source") or {}).get("title")) or "Google 新聞"
             items.append(
                 {
                     "title": title,
                     "snippet": clean(e.get("summary"), 200),
                     "source": src,
                     "url": e.get("link", ""),
-                    "date": (t or datetime.now(timezone.utc)).astimezone(TW).strftime("%m/%d"),
+                    "date": t.astimezone(TW).strftime("%m/%d"),
                 }
             )
+    print(f"排除：{dropped}")
     # 官方來源優先排前面
     items.sort(key=lambda x: 0 if x["source"].startswith("勞動部") else 1)
     return items[:60]
 
 
 # ---------------- 2. Gemini 摘要 ----------------
-PROMPT = """你是台灣企業人資法遵顧問。以下是過去一天抓到的勞動相關新聞清單（含編號）。
+PROMPT = """你是台灣企業人資法遵顧問。今天是 {today}，以下是「昨天（{yesterday}）」的勞動相關新聞清單（含編號）。
 請完成：
 1. 刪除與「台灣勞動法令、勞動政策、勞資爭議、裁罰判決」無關的內容，以及重複報導同一事件的新聞（保留最權威的來源，勞動部優先）。
+   也要刪除看起來是舊聞的項目：例如內容提到的事件、會議或公布日期明顯早於昨天，或是「懶人包、整理、回顧」類的舊文重發。
 2. 依對企業人資的重要性，最多挑出 {max_items} 則。
 3. 每則分類為以下其一：法規修正、函釋解釋、裁罰判決、立法動態、政策動態。
 4. 每則寫：
@@ -147,12 +171,18 @@ GEMINI_MODELS = [
 ]
 
 
+GEMINI_DEADLINE = time.time() + 300  # AI 最多嘗試 5 分鐘，確保在 10 分鐘時限內一定推得出去
+
+
 def call_gemini(model, api_key, body):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     for attempt in range(3):  # 免費額度偶爾回 429/503，等一下再試
-        r = requests.post(url, headers={"x-goog-api-key": api_key}, json=body, timeout=150)
-        if r.status_code in (429, 500, 503) and attempt < 2:
-            time.sleep(30 * (attempt + 1))
+        left = GEMINI_DEADLINE - time.time()
+        if left < 20:
+            raise RuntimeError("已超過 AI 嘗試時間上限")
+        r = requests.post(url, headers={"x-goog-api-key": api_key}, json=body, timeout=min(120, left))
+        if r.status_code in (429, 500, 503) and attempt < 2 and GEMINI_DEADLINE - time.time() > 60:
+            time.sleep(20 * (attempt + 1))
             continue
         if r.status_code != 200:
             # 印出 Google 回傳的完整錯誤說明，方便判斷原因
@@ -183,7 +213,11 @@ def summarize(items, max_items):
         for i, it in enumerate(items)
     )
     body = {
-        "contents": [{"parts": [{"text": PROMPT.format(max_items=max_items, news=news_text)}]}],
+        "contents": [{"parts": [{"text": PROMPT.format(
+            max_items=max_items, news=news_text,
+            today=datetime.now(TW).strftime("%Y-%m-%d"),
+            yesterday=yesterday_range()[0].strftime("%Y-%m-%d"),
+        )}]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2},
     }
     data, errors = None, []
@@ -319,12 +353,11 @@ def push(message):
 
 
 def main():
-    hours = int(os.environ.get("HOURS_BACK", "26"))
     max_items = int(os.environ.get("MAX_ITEMS", "6"))
     wk = "一二三四五六日"[datetime.now(TW).weekday()]
     today = datetime.now(TW).strftime("%m/%d") + f"（{wk}）"
 
-    items = fetch_news(hours)
+    items = fetch_news()
     print(f"抓到 {len(items)} 則候選新聞")
     if not items:
         push({"type": "text", "text": f"【勞動法令日報】{today}\n今日沒有抓到相關新聞。"})
