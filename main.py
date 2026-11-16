@@ -20,7 +20,7 @@ import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import feedparser
 import requests
@@ -41,8 +41,19 @@ MOL_FEEDS = [
     ("勞動部即時新聞澄清", "https://www.mol.gov.tw/1607/1632/2660/RssList"),
 ]
 
-# 這些是「轉載平台」：常把幾個月前的舊文章重新上架，日期會顯示成今天，所以排除
-BLOCKED_SOURCES = ["LINE TODAY", "LINE Today", "Yahoo", "MSN", "PChome", "Hinet", "蕃新聞", "TEEPR", "Newtalk 新頭殼 - 新聞"]
+# Google 新聞「白名單」：只收這些新聞網站「主站」的報導（看網址的網域判斷）。
+# 轉載站與子網站（例如 stock.ltn.com.tw、ai.newtalk.tw、LINE TODAY、Yahoo）
+# 常把幾個月前的舊文章重新上架、日期顯示成最新，所以一律不收。
+# 想新增可信來源，把網域加進來即可（要完整網域，例如 news.ltn.com.tw）。
+TRUSTED_HOSTS = {
+    "www.cna.com.tw", "cna.com.tw", "www.rti.org.tw", "news.pts.org.tw",
+    "news.ltn.com.tw", "ec.ltn.com.tw",
+    "udn.com", "money.udn.com",
+    "www.chinatimes.com", "www.ctee.com.tw",
+    "www.setn.com", "www.ettoday.net", "news.tvbs.com.tw", "news.ebc.net.tw",
+    "www.storm.mg", "www.cw.com.tw", "www.businesstoday.com.tw", "www.mirrormedia.mg",
+    "www.nownews.com", "newtalk.tw", "www.thenewslens.com", "www.twreporter.org",
+}
 
 
 def yesterday_range():
@@ -98,7 +109,7 @@ def fetch_news():
     start, end = yesterday_range()
     print(f"抓取範圍（台灣時間）：{start:%Y-%m-%d %H:%M} ～ {end:%Y-%m-%d %H:%M}")
     items, seen = [], set()
-    dropped = {"無日期": 0, "不是昨天": 0, "轉載平台": 0}
+    dropped = {"無日期": 0, "不是昨天": 0, "非白名單網站": 0}
     for source_name, url in build_feeds(start, end):
         try:
             resp = requests.get(url, headers=HEADERS, timeout=20)
@@ -118,10 +129,13 @@ def fetch_news():
             title = clean(e.get("title"))
             src = source_name
             if source_name == "Google 新聞":
-                src = clean((e.get("source") or {}).get("title")) or "Google 新聞"
-            if any(b.lower() in src.lower() for b in BLOCKED_SOURCES):
-                dropped["轉載平台"] += 1
-                continue
+                source = e.get("source") or {}
+                src = clean(source.get("title")) or "Google 新聞"
+                host = urlparse(source.get("href", "")).netloc.lower()
+                if host not in TRUSTED_HOSTS:
+                    dropped["非白名單網站"] += 1
+                    print(f"  略過（非白名單 {host or '未知網域'}）：{title[:30]}")
+                    continue
             key = norm_title(title)
             if not title or key in seen:
                 continue
